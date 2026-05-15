@@ -1,0 +1,48 @@
+# Sign Language Avatar System Configuration
+
+dataset:
+  train_csv: "archive/sign_mnist_train/sign_mnist_train.csv"
+  test_csv: "archive/sign_mnist_test/sign_mnist_test.csv"
+
+model:
+  checkpoint_path: "models/signnet_best.pth"
+  num_classes: 24
+  dropout_rate: 0.4
+
+training:
+  epochs: 20
+  batch_size: 64
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  scheduler: "ReduceLROnPlateau"
+  scheduler_patience: 3
+  scheduler_factor: 0.5
+
+augmentation:
+  rotation_degrees: 10
+  horizontal_flip: true
+  brightness_jitter: 0.2
+  contrast_jitter: 0.2
+
+inference:
+  confidence_threshold: 0.60
+  roi_size: 300
+  roi_x: null
+  roi_y: null
+  camera_index: 0
+  target_fps: 30
+
+avatar:
+  signs_dir: "assets/signs"
+  min_display_duration_ms: 800
+  max_display_duration_ms: 1500
+  display_duration_ms: 1000
+  space_duration_ms: 400
+  no_sign_duration_ms: 800
+  image_size: 400
+  max_input_chars: 200
+
+logging:
+  log_dir: "logs"
+  training_log_file: "training_log.csv"
+  log_level: "INFO"
