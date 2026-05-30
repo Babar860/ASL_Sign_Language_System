@@ -40,9 +40,13 @@ class MainMenuFrame(tk.Frame):
     def on_show(self) -> None:
         """Refresh checkpoint-dependent recognition availability."""
         checkpoint = Path(self.config_data["model"]["checkpoint_path"])
-        if checkpoint.exists():
+        word_checkpoint = Path(self.config_data["model"]["word_checkpoint_path"])
+        if word_checkpoint.exists():
+            self.recognition_button.configure(state="normal")
+            self.model_status.configure(text=f"Word model loaded from {word_checkpoint}")
+        elif checkpoint.exists():
             self.recognition_button.configure(state="normal")
             self.model_status.configure(text=f"Model loaded from {checkpoint}")
         else:
             self.recognition_button.configure(state="disabled")
-            self.model_status.configure(text="No trained model found. Please run train.py first.")
+            self.model_status.configure(text="No trained model found. Please run train.py or train_words.py first.")

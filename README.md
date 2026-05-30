@@ -23,7 +23,9 @@ The repository expects Sign Language MNIST CSV files at:
 - `archive/sign_mnist_train/sign_mnist_train.csv`
 - `archive/sign_mnist_test/sign_mnist_test.csv`
 
-Gesture images for Avatar mode belong in `assets/signs/`, named `A.png` through `Y.png`, excluding `J.png` and `Z.png`. PNG, JPG, and JPEG files are supported.
+Text-to-Sign assets live in `assets/text_to_sign/`. Letter images belong in `assets/text_to_sign/signs/`, named `A.png` through `Y.png`, excluding `J.png` and `Z.png`. Word or phrase avatar videos belong in `assets/text_to_sign/words/` as MP4 files named after the text, for example `hello.mp4` or `I am fine.mp4`.
+
+Sign-to-Text word video samples are kept separately in `assets/sign_to_text/words/`. Use `python scripts/prepare_wlasl_subset.py --download` to inspect the WLASL processed dataset metadata and extract only videos whose gloss matches the current Text-to-Sign MP4 vocabulary. The script writes `assets/sign_to_text/word_manifest.csv`, which is used by `python train_words.py` to train the word-level CNN checkpoint at `models/word_signnet_best.pth`.
 
 ## Training instructions (`python train.py`)
 
@@ -45,7 +47,7 @@ python main.py
 
 Sign Recognition mode is enabled only when `models/signnet_best.pth` exists. Place your hand inside the 300x300 ROI. The current prediction and sentence buffer are displayed in the app. Use Space for a space, Enter to finalize a word, Backspace to delete, and Q or Back to Menu to close the video feed.
 
-Avatar mode accepts up to 200 characters, normalizes input to uppercase, and plays static gesture images one at a time. Pause, Resume, and Replay controls are available during playback.
+Avatar mode accepts up to 200 characters. If the input has a matching MP4 in `assets/text_to_sign/words/`, it plays that avatar video. Otherwise it normalizes input to uppercase and plays static gesture images one at a time. Pause, Resume, and Replay controls are available during playback.
 
 ## Model Architecture
 
@@ -55,7 +57,9 @@ SignNet accepts `(batch_size, 1, 28, 28)` grayscale tensors and outputs 24 logit
 
 - `src/`: Python source modules for model, preprocessing, training, recognition, avatar, GUI, config, and logging.
 - `models/`: saved model checkpoints.
-- `assets/signs/`: ASL gesture images for Avatar mode.
+- `assets/text_to_sign/signs/`: ASL gesture images for letter-by-letter Avatar mode.
+- `assets/text_to_sign/words/`: MP4 avatar videos for word or phrase Text-to-Sign playback.
+- `assets/sign_to_text/words/`: WLASL word-video samples filtered to the supported Text-to-Sign vocabulary.
 - `logs/`: training logs.
 - `archive/`: Sign Language MNIST CSV data.
 - `.kiro/`: requirements, design, and implementation planning documents.
@@ -66,4 +70,4 @@ Missing model checkpoint: run `python train.py`. Until `models/signnet_best.pth`
 
 Camera not found: confirm the webcam is connected, not already in use, and that `inference.camera_index` in `config.yaml` matches the camera device.
 
-Missing gesture image assets: add PNG or JPG files to `assets/signs/`. If the directory is empty, Avatar mode shows a setup instruction. Missing individual letters display a placeholder and log a warning.
+Missing gesture image assets: add PNG or JPG files to `assets/text_to_sign/signs/`. If the directory is empty, Avatar mode shows a setup instruction. Missing individual letters display a placeholder and log a warning.

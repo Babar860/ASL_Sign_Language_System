@@ -6,12 +6,26 @@ dataset:
 
 model:
   checkpoint_path: "models/signnet_best.pth"
+  word_checkpoint_path: "models/word_signnet_best.pth"
+  word_model_type: "keypoint"
   num_classes: 24
   dropout_rate: 0.4
+  word_frame_count: 16
+  word_image_size: 64
+  word_confidence_threshold: 0.50
+  word_margin_threshold: 0.12
+  word_stability_frames: 3
 
 training:
   epochs: 20
+  word_epochs: 120
   batch_size: 64
+  word_batch_size: 16
+  word_cache_videos: true
+  word_validate_videos: false
+  word_use_bbox: false
+  word_split_strategy: "random"
+  word_keypoints_dir: "assets/sign_to_text/keypoints"
   learning_rate: 0.001
   weight_decay: 0.0001
   scheduler: "ReduceLROnPlateau"
@@ -33,7 +47,10 @@ inference:
   target_fps: 30
 
 avatar:
-  signs_dir: "assets/signs"
+  signs_dir: "assets/text_to_sign/signs"
+  word_videos_dir: "assets/text_to_sign/words"
+  sign_to_text_words_dir: "assets/sign_to_text/words"
+  sign_to_text_manifest: "assets/sign_to_text/wlasl_top100_manifest.csv"
   min_display_duration_ms: 800
   max_display_duration_ms: 1500
   display_duration_ms: 1000

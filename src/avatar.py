@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw
 from src.model import STATIC_LETTERS
 
 DisplayCallback = Callable[[Image.Image | None], None]
+VideoCallback = Callable[[Path | None], None]
 OverlayCallback = Callable[[str], None]
 AfterCallback = Callable[[int, Callable[[], None]], Any]
 
@@ -18,10 +19,17 @@ AfterCallback = Callable[[int, Callable[[], None]], Any]
 class Avatar:
     """Load gesture images and animate typed text letter by letter."""
 
-    def __init__(self, config: dict[str, Any], display_callback: DisplayCallback, overlay_callback: OverlayCallback) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any],
+        display_callback: DisplayCallback,
+        overlay_callback: OverlayCallback,
+        video_callback: VideoCallback | None = None,
+    ) -> None:
         """Create an avatar sequencer."""
         self.config = config
         self.display_callback = display_callback
+        self.video_callback = video_callback
         self.overlay_callback = overlay_callback
         self.state = "IDLE"
         self.sequence = ""
@@ -29,14 +37,34 @@ class Avatar:
         self.after_fn: AfterCallback | None = None
         self.setup_required = False
         self._images: dict[str, Image.Image] = {}
+        self._word_videos: dict[str, Path] = {}
+        self.current_word_video: Path | None = None
         self.placeholder = self._make_placeholder("No Sign Available")
         self.blank = self._make_placeholder("")
         self._load_images()
+        self._load_word_videos()
 
     def play(self, text: str, after_fn: AfterCallback) -> None:
         """Start playback for up to the configured 200-character limit."""
         max_chars = int(self.config["avatar"]["max_input_chars"])
-        self.sequence = text.upper()[:max_chars]
+        entered_text = text[:max_chars]
+        word_video = self._find_word_video(entered_text)
+        if word_video is not None:
+            self.sequence = entered_text.strip()
+            self.index = 0
+            self.after_fn = after_fn
+            self.state = "PLAYING"
+            self.current_word_video = word_video
+            self.display_callback(None)
+            if self.video_callback is not None:
+                self.video_callback(word_video)
+            self.overlay_callback(f"{word_video.stem}")
+            return
+
+        if self.video_callback is not None:
+            self.video_callback(None)
+        self.current_word_video = None
+        self.sequence = entered_text.upper()
         self.index = 0
         self.after_fn = after_fn
         if not self.sequence:
@@ -61,6 +89,13 @@ class Avatar:
         """Restart playback from the beginning of the current input."""
         if after_fn is not None:
             self.after_fn = after_fn
+        if self.current_word_video is not None and self.video_callback is not None:
+            self.state = "PLAYING"
+            self.index = 0
+            self.display_callback(None)
+            self.video_callback(self.current_word_video)
+            self.overlay_callback(f"{self.current_word_video.stem}")
+            return
         if self.sequence and self.after_fn is not None:
             self.index = 0
             self.state = "PLAYING"
@@ -85,6 +120,34 @@ class Avatar:
                     (int(self.config["avatar"]["image_size"]), int(self.config["avatar"]["image_size"])),
                     Image.Resampling.LANCZOS,
                 )
+
+    def _load_word_videos(self) -> None:
+        videos_dir = Path(self.config["avatar"]["word_videos_dir"])
+        videos_dir.mkdir(parents=True, exist_ok=True)
+        for video_path in videos_dir.rglob("*.mp4"):
+            for key in self._word_keys(video_path.stem):
+                self._word_videos.setdefault(key, video_path)
+
+    def _find_word_video(self, text: str) -> Path | None:
+        clean_text = text.replace("%0A", "").replace("\n", "").strip()
+        words = clean_text.split()
+        if not words:
+            return None
+
+        candidates = {" ".join(words), "-".join(words), "_".join(words)}
+        for key in {word_key for candidate in candidates for word_key in self._word_keys(candidate)}:
+            video_path = self._word_videos.get(key)
+            if video_path is not None:
+                return video_path
+        return None
+
+    def _word_keys(self, word: str) -> set[str]:
+        lowered = word.strip().lower()
+        compact = "".join(ch for ch in lowered if ch.isalnum())
+        keys = {key for key in (lowered, compact) if key}
+        if lowered.endswith("%0"):
+            keys.update(self._word_keys(lowered[:-2]))
+        return keys
 
     def _find_image(self, signs_dir: Path, letter: str) -> Path | None:
         candidates = [path for path in signs_dir.rglob("*") if path.suffix.lower() in {".png", ".jpg", ".jpeg"}]
@@ -112,6 +175,8 @@ class Avatar:
         if self.index >= len(self.sequence):
             self.state = "DONE"
             self.display_callback(None)
+            if self.video_callback is not None:
+                self.video_callback(None)
             self.overlay_callback("Done")
             return
 

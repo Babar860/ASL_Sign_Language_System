@@ -2,6 +2,8 @@ import pytest
 import torch
 
 from src.model import SignNet
+from src.keypoint_model import KEYPOINT_DIM, KeypointWordNet
+from src.word_model import WordSignNet
 
 
 def test_signnet_output_shape():
@@ -25,3 +27,13 @@ def test_predict_bounds():
 def test_bad_shape_rejected():
     with pytest.raises(ValueError):
         SignNet()(torch.rand(1, 3, 28, 28))
+
+
+def test_word_signnet_output_shape():
+    model = WordSignNet(num_classes=3).eval()
+    assert tuple(model(torch.rand(2, 4, 1, 64, 64)).shape) == (2, 3)
+
+
+def test_keypoint_wordnet_output_shape():
+    model = KeypointWordNet(num_classes=5).eval()
+    assert tuple(model(torch.rand(2, 16, KEYPOINT_DIM)).shape) == (2, 5)

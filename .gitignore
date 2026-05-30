@@ -42,6 +42,7 @@ models/*
 *.ckpt
 
 # Dataset archives and large local data
+archive/
 archive/*.csv
 archive/sign_mnist_train/
 archive/sign_mnist_test/
@@ -51,8 +52,11 @@ archive/sign_mnist_test/
 *.7z
 
 # Generated local avatar/image assets
-assets/signs/*
-!assets/signs/.gitkeep
+# Track `assets/` contents (videos, manifests, etc.).
+# Ignore any sample files under `assets/` so they are not pushed.
+assets/**/sample*
+assets/sign_to_text/keypoints/
+!assets/**/.gitkeep
 
 # Build and packaging artifacts
 build/
