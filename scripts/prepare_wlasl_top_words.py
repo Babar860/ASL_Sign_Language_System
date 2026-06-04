@@ -24,6 +24,7 @@ def main() -> None:
     parser.add_argument("--output", default="assets/sign_to_text/wlasl_top1500_manifest.csv")
     parser.add_argument("--words-output", default="assets/sign_to_text/wlasl_top1500_words.txt")
     parser.add_argument("--extract-dir", default="assets/sign_to_text/wlasl_top1500_words")
+    parser.add_argument("--max-samples-per-word", type=int, default=0)
     parser.add_argument("--copy-videos", action="store_true")
     args = parser.parse_args()
 
@@ -43,7 +44,15 @@ def main() -> None:
         counts = _count_available_videos(entries, video_names)
         selected = [label for label, _ in counts.most_common(args.count)]
         selected_set = set(selected)
-        records = _records(entries, selected_set, video_names, archive, extract_dir, copy_videos=args.copy_videos)
+        records = _records(
+            entries,
+            selected_set,
+            video_names,
+            archive,
+            extract_dir,
+            copy_videos=args.copy_videos,
+            max_samples_per_word=max(0, int(args.max_samples_per_word)),
+        )
 
     with output_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=["path", "label", "video_id", "split", "frame_start", "frame_end", "bbox"])
@@ -77,6 +86,7 @@ def _records(
     archive: zipfile.ZipFile,
     extract_dir: Path,
     copy_videos: bool,
+    max_samples_per_word: int = 0,
 ) -> list[dict[str, str]]:
     records: list[dict[str, str]] = []
     for entry in entries:
@@ -84,7 +94,10 @@ def _records(
         if label not in selected:
             continue
         label_dir = compact_word_key(label)
+        copied_for_label = 0
         for instance in entry.get("instances", []):
+            if max_samples_per_word and copied_for_label >= max_samples_per_word:
+                break
             video_id = str(instance.get("video_id", ""))
             archive_name = video_names.get(video_id)
             if archive_name is None:
@@ -105,6 +118,7 @@ def _records(
                     "bbox": json.dumps(instance.get("bbox", [])),
                 }
             )
+            copied_for_label += 1
     return records
 
 

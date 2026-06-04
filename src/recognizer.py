@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 import torch
 
-from src.keypoint_model import KeypointWordNet, MediaPipeKeypointExtractor
+from src.keypoint_model import KEYPOINT_DIM, KeypointWordNet, MediaPipeKeypointExtractor, keypoint_motion_features, normalize_keypoint_sequence
 from src.model import SignNet, index_to_letter
 from src.preprocessor import Preprocessor
 from src.word_model import LegacyWordSignNet, WORD_MODEL_TYPES, WordSignNet
@@ -121,7 +121,8 @@ class Recognizer:
         self.keypoint_buffer = self.keypoint_buffer[-frame_count:]
         if len(self.keypoint_buffer) < frame_count:
             return "Collecting..."
-        tensor = torch.from_numpy(np.asarray(self.keypoint_buffer, dtype=np.float32)).unsqueeze(0).to(self.device)
+        sequence = keypoint_motion_features(np.asarray(self.keypoint_buffer, dtype=np.float32))
+        tensor = torch.from_numpy(sequence).unsqueeze(0).to(self.device)
         return self._word_label_from_tensor(tensor)
 
     def _word_label_from_tensor(self, tensor: torch.Tensor) -> str:
@@ -222,6 +223,7 @@ def load_model_for_inference(config: dict[str, Any]) -> SignNet | WordSignNet | 
                 model = KeypointWordNet(
                     num_classes=len(labels),
                     dropout_rate=float(config["model"]["dropout_rate"]),
+                    input_dim=int(checkpoint.get("input_dim", KEYPOINT_DIM)) if isinstance(checkpoint, dict) else KEYPOINT_DIM,
                 ).to(device)
                 model.load_state_dict(state)
             else:

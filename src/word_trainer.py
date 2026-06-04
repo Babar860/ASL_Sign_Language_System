@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -14,10 +15,10 @@ import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader, Dataset, random_split
 
-from src.keypoint_model import KeypointWordNet, MediaPipeKeypointExtractor, keypoint_cache_path
+from src.keypoint_model import KeypointWordNet, MediaPipeKeypointExtractor, keypoint_cache_path, keypoint_motion_features
 from src.preprocessor import Preprocessor
 from src.trainer import _ensure_optimizer_dynamo_compatibility
-from src.word_model import WordSignNet
+from src.word_model import LegacyWordSignNet, WordSignNet
 from src.word_vocab import display_word_label, normalize_word_label
 
 
@@ -147,10 +148,12 @@ class KeypointWordDataset(Dataset):
         frame_count: int,
         cache_dir: str | Path,
         use_bbox: bool = False,
+        keypoint_workers: int = 1,
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.frame_count = int(frame_count)
         self.cache_dir = Path(cache_dir)
+        self.keypoint_workers = max(1, int(keypoint_workers))
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.samples: list[dict[str, Any]] = []
         self.cached_samples: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -189,36 +192,53 @@ class KeypointWordDataset(Dataset):
         return self.cached_samples[index]
 
     def _cache_keypoints(self) -> None:
-        extractor = MediaPipeKeypointExtractor(frame_count=self.frame_count)
-        try:
-            for index, sample in enumerate(self.samples, start=1):
-                cache_path = keypoint_cache_path(
-                    self.cache_dir,
-                    sample["path"],
-                    sample["frame_start"],
-                    sample["frame_end"],
-                    sample["bbox"],
+        missing_tasks: list[dict[str, Any]] = []
+        cache_paths: list[Path] = []
+        for sample in self.samples:
+            cache_path = keypoint_cache_path(
+                self.cache_dir,
+                sample["path"],
+                sample["frame_start"],
+                sample["frame_end"],
+                sample["bbox"],
+            )
+            cache_paths.append(cache_path)
+            if not cache_path.exists():
+                missing_tasks.append(
+                    {
+                        "path": str(sample["path"]),
+                        "frame_start": int(sample["frame_start"]),
+                        "frame_end": int(sample["frame_end"]),
+                        "bbox": sample["bbox"],
+                        "cache_path": str(cache_path),
+                    }
                 )
-                if cache_path.exists():
-                    sequence = np.load(cache_path)
-                else:
-                    sequence = extractor.video_keypoints(
-                        sample["path"],
-                        frame_start=sample["frame_start"],
-                        frame_end=sample["frame_end"],
-                        bbox=sample["bbox"],
-                    )
-                    np.save(cache_path, sequence)
-                self.cached_samples.append(
-                    (
-                        torch.from_numpy(sequence.astype(np.float32)),
-                        torch.tensor(int(sample["label_index"]), dtype=torch.long),
-                    )
-                )
-                if index % 25 == 0 or index == len(self.samples):
-                    print(f"Cached {index}/{len(self.samples)} keypoint sequences")
-        finally:
-            extractor.close()
+
+        if missing_tasks:
+            self._extract_missing_keypoints(missing_tasks)
+
+        for index, (sample, cache_path) in enumerate(zip(self.samples, cache_paths), start=1):
+            sequence = np.load(cache_path)
+            normalized = keypoint_motion_features(sequence)
+            self.cached_samples.append(
+                (torch.from_numpy(normalized.astype(np.float32)), torch.tensor(int(sample["label_index"]), dtype=torch.long))
+            )
+            if index % 25 == 0 or index == len(self.samples):
+                print(f"Cached {index}/{len(self.samples)} keypoint sequences", flush=True)
+
+    def _extract_missing_keypoints(self, missing_tasks: list[dict[str, Any]]) -> None:
+        workers = self.keypoint_workers
+        if workers <= 1 or len(missing_tasks) < 8:
+            _extract_keypoint_batch(missing_tasks, self.frame_count)
+            return
+
+        chunks = _chunk_tasks(missing_tasks, workers)
+        completed = 0
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_extract_keypoint_batch, chunk, self.frame_count) for chunk in chunks]
+            for future in as_completed(futures):
+                completed += int(future.result())
+                print(f"Extracted {completed}/{len(missing_tasks)} missing keypoint sequences", flush=True)
 
 
 class WordTrainer:
@@ -226,6 +246,7 @@ class WordTrainer:
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
+        torch.set_num_threads(min(4, max(1, torch.get_num_threads())))
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model_cfg = config["model"]
         self.model_type = str(model_cfg.get("word_model_type", "cnn")).lower()
@@ -235,10 +256,12 @@ class WordTrainer:
                 frame_count=int(model_cfg["word_frame_count"]),
                 cache_dir=config["training"]["word_keypoints_dir"],
                 use_bbox=bool(config["training"].get("word_use_bbox", False)),
+                keypoint_workers=int(config["training"].get("word_keypoint_workers", 1)),
             )
             self.model = KeypointWordNet(
                 num_classes=len(self.dataset.labels),
                 dropout_rate=float(model_cfg["dropout_rate"]),
+                input_dim=self.dataset[0][0].shape[-1],
             ).to(self.device)
         else:
             self.dataset = WordVideoDataset(
@@ -249,7 +272,8 @@ class WordTrainer:
                 cache_videos=bool(config["training"].get("word_cache_videos", True)),
                 use_bbox=bool(config["training"].get("word_use_bbox", True)),
             )
-            self.model = WordSignNet(
+            word_model_class = LegacyWordSignNet if self.model_type == "summary_cnn" else WordSignNet
+            self.model = word_model_class(
                 num_classes=len(self.dataset.labels),
                 dropout_rate=float(model_cfg["dropout_rate"]),
             ).to(self.device)
@@ -263,37 +287,54 @@ class WordTrainer:
             train_dataset = torch.utils.data.Subset(self.dataset, train_indices)
             val_dataset = torch.utils.data.Subset(self.dataset, val_indices)
         else:
-            val_size = max(1, int(len(self.dataset) * 0.2)) if len(self.dataset) > 1 else 0
-            train_size = len(self.dataset) - val_size
-            train_dataset, val_dataset = random_split(
-                self.dataset,
-                [train_size, val_size],
-                generator=torch.Generator().manual_seed(42),
-            )
+            train_dataset, val_dataset = self._random_split_by_label()
 
         batch_size = int(train_cfg.get("word_batch_size", train_cfg["batch_size"]))
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
 
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.03)
         _ensure_optimizer_dynamo_compatibility()
-        optimizer = optim.Adam(
+        optimizer = optim.AdamW(
             self.model.parameters(),
             lr=float(train_cfg["learning_rate"]),
             weight_decay=max(float(train_cfg["weight_decay"]), 1e-4),
         )
+        epochs = int(train_cfg.get("word_epochs", train_cfg["epochs"]))
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, epochs),
+            eta_min=float(train_cfg["learning_rate"]) * 0.05,
+        )
 
         best_accuracy = 0.0
-        epochs = int(train_cfg.get("word_epochs", train_cfg["epochs"]))
         for epoch in range(1, epochs + 1):
             train_loss = self._train_epoch(train_loader, criterion, optimizer)
             accuracy = self.evaluate(val_loader)
             if accuracy >= best_accuracy:
                 best_accuracy = accuracy
                 self.save_checkpoint(accuracy)
-            print(f"Word epoch [{epoch}/{epochs}], Loss: {train_loss:.4f}, Val Accuracy: {accuracy:.2f}%")
+            scheduler.step()
+            print(f"Word epoch [{epoch}/{epochs}], Loss: {train_loss:.4f}, Val Accuracy: {accuracy:.2f}%", flush=True)
 
         return {"overall_accuracy": best_accuracy, "classes": self.dataset.labels}
+
+    def _random_split_by_label(self) -> tuple[torch.utils.data.Subset, torch.utils.data.Subset]:
+        rng = torch.Generator().manual_seed(42)
+        by_label: dict[int, list[int]] = {}
+        for index, sample in enumerate(self.dataset.samples):
+            by_label.setdefault(int(sample["label_index"]), []).append(index)
+
+        train_indices: list[int] = []
+        val_indices: list[int] = []
+        for indices in by_label.values():
+            order = torch.randperm(len(indices), generator=rng).tolist()
+            shuffled = [indices[position] for position in order]
+            val_count = max(1, int(round(len(shuffled) * 0.2))) if len(shuffled) > 1 else 0
+            val_indices.extend(shuffled[:val_count])
+            train_indices.extend(shuffled[val_count:])
+
+        return torch.utils.data.Subset(self.dataset, train_indices), torch.utils.data.Subset(self.dataset, val_indices)
 
     def _train_epoch(self, loader: DataLoader, criterion: nn.Module, optimizer: optim.Optimizer) -> float:
         self.model.train()
@@ -301,9 +342,12 @@ class WordTrainer:
         for videos, labels in loader:
             videos = videos.to(self.device)
             labels = labels.to(self.device)
+            if self.model_type == "keypoint":
+                videos = _augment_keypoint_batch(videos)
             optimizer.zero_grad()
             loss = criterion(self.model(videos), labels)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=2.0)
             optimizer.step()
             running_loss += float(loss.item())
         return running_loss / max(1, len(loader))
@@ -333,10 +377,50 @@ class WordTrainer:
                 "image_size": int(self.config["model"]["word_image_size"]),
                 "architecture": getattr(self.model, "architecture", "unknown"),
                 "model_type": self.model_type,
+                "input_dim": int(self.dataset[0][0].shape[-1]),
             },
             checkpoint_path,
         )
-        print(f"Saved word checkpoint to {checkpoint_path} ({accuracy:.2f}%)")
+        print(f"Saved word checkpoint to {checkpoint_path} ({accuracy:.2f}%)", flush=True)
+
+
+def _chunk_tasks(tasks: list[dict[str, Any]], workers: int) -> list[list[dict[str, Any]]]:
+    chunk_count = max(1, min(workers, len(tasks)))
+    chunks: list[list[dict[str, Any]]] = [[] for _ in range(chunk_count)]
+    for index, task in enumerate(tasks):
+        chunks[index % chunk_count].append(task)
+    return [chunk for chunk in chunks if chunk]
+
+
+def _extract_keypoint_batch(tasks: list[dict[str, Any]], frame_count: int) -> int:
+    extractor = MediaPipeKeypointExtractor(frame_count=frame_count)
+    completed = 0
+    try:
+        for task in tasks:
+            cache_path = Path(task["cache_path"])
+            if cache_path.exists():
+                completed += 1
+                continue
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            sequence = extractor.video_keypoints(
+                task["path"],
+                frame_start=int(task["frame_start"]),
+                frame_end=int(task["frame_end"]),
+                bbox=task["bbox"],
+            )
+            np.save(cache_path, sequence)
+            completed += 1
+    finally:
+        extractor.close()
+    return completed
+
+
+def _augment_keypoint_batch(batch: torch.Tensor) -> torch.Tensor:
+    if batch.ndim != 3:
+        return batch
+    noise = torch.randn_like(batch) * 0.01
+    keep_mask = (torch.rand(batch.shape[0], batch.shape[1], 1, device=batch.device) > 0.03).float()
+    return (batch + noise) * keep_mask
 
 
 def main() -> None:

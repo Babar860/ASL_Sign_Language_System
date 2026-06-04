@@ -56,6 +56,15 @@ archive/sign_mnist_test/
 # Ignore any sample files under `assets/` so they are not pushed.
 assets/**/sample*
 assets/sign_to_text/keypoints/
+assets/sign_to_text/keypoints_*/
+assets/sign_to_text/wlasl_cached*_manifest.csv
+assets/sign_to_text/wlasl_cached*_words.txt
+assets/sign_to_text/wlasl_top1500_manifest.csv
+assets/sign_to_text/wlasl_top1500_words.txt
+assets/sign_to_text/wlasl_top1500_words/
+assets/sign_to_text/wlasl_top500_words/
+assets/sign_to_text/word_manifest*.csv
+assets/sign_to_text/words/
 !assets/**/.gitkeep
 
 # Build and packaging artifacts

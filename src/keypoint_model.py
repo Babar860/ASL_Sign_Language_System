@@ -34,7 +34,7 @@ class MediaPipeKeypointExtractor:
         self.mp_holistic = mp.solutions.holistic
         self.holistic = self.mp_holistic.Holistic(
             static_image_mode=False,
-            model_complexity=1,
+            model_complexity=0,
             smooth_landmarks=True,
             enable_segmentation=False,
             refine_face_landmarks=False,
@@ -71,14 +71,26 @@ class MediaPipeKeypointExtractor:
             else:
                 frame_indices = np.arange(start_index, start_index + self.frame_count, dtype=int)
 
-            for frame_index in frame_indices:
-                capture.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+            capture.set(cv2.CAP_PROP_POS_FRAMES, int(start_index))
+            current_index = start_index
+            last_vector: np.ndarray | None = None
+            for target_index in frame_indices:
+                target_index = int(target_index)
+                if target_index < current_index and last_vector is not None:
+                    vectors.append(last_vector)
+                    continue
+                while current_index < target_index:
+                    if not capture.grab():
+                        break
+                    current_index += 1
                 ok, frame = capture.read()
+                current_index += 1
                 if not ok or frame is None:
                     continue
                 if bbox is not None:
                     frame = _crop_bbox(frame, bbox)
-                vectors.append(self.frame_keypoints(frame))
+                last_vector = self.frame_keypoints(frame)
+                vectors.append(last_vector)
         finally:
             capture.release()
         if not vectors:
@@ -106,42 +118,121 @@ def sample_keypoint_sequence(sequence: np.ndarray, frame_count: int) -> np.ndarr
     return np.concatenate((sequence, padding), axis=0).astype(np.float32)
 
 
+def normalize_keypoint_sequence(sequence: np.ndarray) -> np.ndarray:
+    """Center and scale pose/hand landmarks frame-by-frame."""
+    normalized = np.asarray(sequence, dtype=np.float32).copy()
+    if normalized.ndim != 2 or normalized.shape[1] != KEYPOINT_DIM:
+        raise ValueError(f"Expected keypoint sequence shape (T, {KEYPOINT_DIM}), got {tuple(normalized.shape)}")
+
+    pose_end = POSE_LANDMARKS * 4
+    left_hand_end = pose_end + HAND_LANDMARKS * 3
+    for frame in normalized:
+        pose = frame[:pose_end].reshape(POSE_LANDMARKS, 4)
+        left_hand = frame[pose_end:left_hand_end].reshape(HAND_LANDMARKS, 3)
+        right_hand = frame[left_hand_end:].reshape(HAND_LANDMARKS, 3)
+
+        pose_visible = pose[:, 3] > 0.2
+        hand_points = np.concatenate((left_hand[:, :2], right_hand[:, :2]), axis=0)
+        hand_visible = np.any(hand_points != 0.0, axis=1)
+
+        center_points: list[np.ndarray] = []
+        if pose_visible[11] and pose_visible[12]:
+            center_points.append((pose[11, :2] + pose[12, :2]) / 2.0)
+        if pose_visible[23] and pose_visible[24]:
+            center_points.append((pose[23, :2] + pose[24, :2]) / 2.0)
+        if center_points:
+            center = np.mean(np.asarray(center_points, dtype=np.float32), axis=0)
+        elif pose_visible.any():
+            center = pose[pose_visible, :2].mean(axis=0)
+        elif hand_visible.any():
+            center = hand_points[hand_visible].mean(axis=0)
+        else:
+            continue
+
+        if pose_visible[11] and pose_visible[12]:
+            scale = float(np.linalg.norm(pose[11, :2] - pose[12, :2]))
+        else:
+            visible_points = []
+            if pose_visible.any():
+                visible_points.append(pose[pose_visible, :2])
+            if hand_visible.any():
+                visible_points.append(hand_points[hand_visible])
+            merged = np.concatenate(visible_points, axis=0)
+            scale = float(np.max(np.ptp(merged, axis=0)))
+        scale = max(scale, 1e-3)
+
+        pose[pose_visible, :2] = (pose[pose_visible, :2] - center) / scale
+        pose[pose_visible, 2] = pose[pose_visible, 2] / scale
+        left_visible = np.any(left_hand[:, :2] != 0.0, axis=1)
+        right_visible = np.any(right_hand[:, :2] != 0.0, axis=1)
+        left_hand[left_visible, :2] = (left_hand[left_visible, :2] - center) / scale
+        left_hand[left_visible, 2] = left_hand[left_visible, 2] / scale
+        right_hand[right_visible, :2] = (right_hand[right_visible, :2] - center) / scale
+        right_hand[right_visible, 2] = right_hand[right_visible, 2] / scale
+
+    return normalized
+
+
+def keypoint_motion_features(sequence: np.ndarray) -> np.ndarray:
+    """Return normalized positions plus velocity and acceleration features."""
+    normalized = normalize_keypoint_sequence(sequence)
+    velocity = np.diff(normalized, axis=0, prepend=normalized[:1])
+    acceleration = np.diff(velocity, axis=0, prepend=velocity[:1])
+    return np.concatenate((normalized, velocity, acceleration), axis=1).astype(np.float32)
+
+
 class KeypointWordNet(nn.Module):
     """Temporal model over MediaPipe pose and hand keypoint sequences."""
 
-    architecture = "mediapipe_keypoint_tcn_v1"
+    architecture = "mediapipe_keypoint_motion_bigru_attention_v4"
 
-    def __init__(self, num_classes: int, dropout_rate: float = 0.4, input_dim: int = KEYPOINT_DIM) -> None:
+    def __init__(self, num_classes: int, dropout_rate: float = 0.4, input_dim: int = KEYPOINT_DIM * 3) -> None:
         super().__init__()
         if num_classes <= 0:
             raise ValueError("KeypointWordNet requires at least one class")
         self.input_norm = nn.LayerNorm(input_dim)
+        self.input_dim = int(input_dim)
         self.input_projection = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(inplace=True),
+            nn.Linear(input_dim, 384),
+            nn.GELU(),
             nn.Dropout(dropout_rate),
+            nn.Linear(384, 384),
+            nn.GELU(),
+        )
+        self.recurrent = nn.GRU(
+            input_size=384,
+            hidden_size=192,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout_rate,
         )
         self.temporal = nn.Sequential(
-            _TemporalBlock(256, dilation=1, dropout_rate=dropout_rate),
-            _TemporalBlock(256, dilation=2, dropout_rate=dropout_rate),
-            _TemporalBlock(256, dilation=4, dropout_rate=dropout_rate),
-            _TemporalBlock(256, dilation=8, dropout_rate=dropout_rate),
+            _TemporalBlock(384, dilation=1, dropout_rate=dropout_rate),
+            _TemporalBlock(384, dilation=2, dropout_rate=dropout_rate),
+            _TemporalBlock(384, dilation=4, dropout_rate=dropout_rate),
         )
-        self.attention = nn.Sequential(nn.Conv1d(256, 128, kernel_size=1), nn.Tanh(), nn.Conv1d(128, 1, kernel_size=1))
+        self.attention = nn.Sequential(nn.Linear(384, 192), nn.Tanh(), nn.Linear(192, 1))
         self.classifier = nn.Sequential(
-            nn.Linear(512, 384),
+            nn.LayerNorm(768),
+            nn.Linear(768, 512),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout_rate),
-            nn.Linear(384, num_classes),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate),
+            nn.Linear(256, num_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 3 or x.shape[2] != KEYPOINT_DIM:
-            raise ValueError(f"Expected input shape (B, T, {KEYPOINT_DIM}), got {tuple(x.shape)}")
-        temporal = self.temporal(self.input_projection(self.input_norm(x)).transpose(1, 2))
-        weights = torch.softmax(self.attention(temporal), dim=2)
-        attended = (temporal * weights).sum(dim=2)
-        pooled = temporal.max(dim=2).values
+        if x.ndim != 3 or x.shape[2] != self.input_dim:
+            raise ValueError(f"Expected input shape (B, T, {self.input_dim}), got {tuple(x.shape)}")
+        projected = self.input_projection(self.input_norm(x))
+        recurrent, _ = self.recurrent(projected)
+        temporal = self.temporal(recurrent.transpose(1, 2)).transpose(1, 2)
+        weights = torch.softmax(self.attention(temporal), dim=1)
+        attended = (temporal * weights).sum(dim=1)
+        pooled = temporal.max(dim=1).values
         return self.classifier(torch.cat((attended, pooled), dim=1))
 
     def predict(self, x: torch.Tensor) -> tuple[int, float]:
